@@ -443,6 +443,21 @@ fragment float4 bg_image_fragment(
   return rgba;
 }
 
+
+// wallpaper
+fragment float4 wallpaper_fragment(
+  FullScreenVertexOut in [[stage_in]],
+  constant Uniforms& uniforms [[buffer(1)]],
+  texture2d<float> image [[texture(0)]]
+) {
+  sampler s = sampler(coord::pixel, address::clamp_to_edge, filter::linear);
+  float2 tex_size = float2(image.get_width(), image.get_height());
+  float2 tex_coord = (in.position.xy / uniforms.screen_size) * tex_size;
+  float4 rgba = image.sample(s, tex_coord);
+  rgba.rgb *= rgba.a;
+  return rgba;
+}
+
 //-------------------------------------------------------------------
 // Cell Background Shader
 //-------------------------------------------------------------------
@@ -850,4 +865,3 @@ fragment float4 image_fragment(
 
   return rgba;
 }
-

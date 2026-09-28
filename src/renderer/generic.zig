@@ -215,6 +215,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// of the background image buffer whenever we change it.
         bg_image_buffer_modified: usize = 0,
 
+        /// Static CPU-side buffer for the wallpaper image.
+        wallpaper_buffer: []u8 = &.{},
+        wallpaper_width: u32 = 0,
+        wallpaper_height: u32 = 0,
+        wallpaper_texture: ?Texture = null,
+        wallpaper_texture_modified: usize = 0,
+        wallpaper_buffer_modified: usize = 0,
+
         /// Graphics API state.
         api: GraphicsAPI,
 
@@ -601,6 +609,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             bg_image_position: configpkg.BackgroundImagePosition,
             bg_image_fit: configpkg.BackgroundImageFit,
             bg_image_repeat: bool,
+            wallpaper_image: ?configpkg.Path,
             links: link.Set,
             vsync: bool,
             colorspace: configpkg.Config.WindowColorspace,
@@ -672,6 +681,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     .custom_shaders = custom_shaders,
                     .bg_image = bg_image,
+                    .wallpaper_image = if (config.@"wallpaper-image") |p| try p.clone(alloc) else null,
                     .bg_image_opacity = config.@"background-image-opacity",
                     .bg_image_position = config.@"background-image-position",
                     .bg_image_fit = config.@"background-image-fit",
@@ -816,6 +826,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             result.updateBgImageBuffer();
             try result.prepBackgroundImage();
 
+            // Load wallpaper if configured.
+            if (result.config.wallpaper_image) |path| {
+                const path_str: []const u8 = switch (path) {
+                    inline else => |s| s,
+                };
+                result.loadWallpaper(result.alloc, path_str) catch |err| {
+                    log.warn("error loading wallpaper: {}", .{err});
+                };
+            }
+
             return result;
         }
 
@@ -844,6 +864,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.font_shaper_cache.deinit(self.alloc);
 
             self.config.deinit();
+
+            if (self.wallpaper_buffer.len > 0) self.alloc.free(self.wallpaper_buffer);
+
             self.api.deinit();
 
             self.* = undefined;
@@ -905,6 +928,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (self.bg_image) |img| {
                     img.deinit(self.alloc);
                     self.bg_image = null;
+                }
+
+                if (self.wallpaper_texture) |tex| {
+                    tex.deinit();
+                    self.wallpaper_texture = null;
                 }
             }
 
@@ -1831,6 +1859,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Upload the background image to the GPU as necessary.
             try self.uploadBackgroundImage();
 
+            // Upload the wallpaper buffer to GPU as a texture if we have one.
+            if (self.wallpaper_buffer.len > 0 and self.wallpaper_texture_modified != self.wallpaper_buffer_modified) {
+                log.warn("uploading wallpaper buffer len={} w={} h={}", .{ self.wallpaper_buffer.len, self.wallpaper_width, self.wallpaper_height });
+                if (self.wallpaper_texture) |old| old.deinit();
+                self.wallpaper_texture = Texture.init(
+                    self.api.imageTextureOptions(.rgba, true),
+                    self.wallpaper_width,
+                    self.wallpaper_height,
+                    self.wallpaper_buffer,
+                ) catch |err| {
+                    log.warn("error creating wallpaper texture: {}", .{err});
+                    return err;
+                };
+                self.wallpaper_texture_modified = self.wallpaper_buffer_modified;
+            }
+
             // Update per-frame custom shader uniforms.
             try self.updateCustomShaderUniformsForFrame();
 
@@ -1878,6 +1922,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }});
                 defer pass.complete();
 
+                // Draw wallpaper behind everything if we have one.
+                if (self.wallpaper_texture) |tex| {
+                    log.warn("drawing wallpaper texture w={} h={}", .{ self.wallpaper_width, self.wallpaper_height });
+                    pass.step(.{
+                        .pipeline = self.shaders.pipelines.wallpaper,
+                        .uniforms = frame.uniforms.buffer,
+                        .buffers = &.{null},
+                        .textures = &.{tex},
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    });
+                }
+
                 // First we draw our background image, if we have one.
                 // The bg image shader also draws the main bg color.
                 //
@@ -1898,7 +1954,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .draw = .{ .type = .triangle, .vertex_count = 3 },
                     }),
                     else => {},
-                } else {
+                } else if (self.wallpaper_texture == null) {
                     pass.step(.{
                         .pipeline = self.shaders.pipelines.bg_color,
                         .uniforms = frame.uniforms.buffer,
@@ -2024,6 +2080,86 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // waiting for all in-flight frames to complete, and this
             // callback is what signals that completion.
             self.swap_chain.?.releaseFrame();
+        }
+
+        /// Loads the wallpaper image into wallpaper_buffer.
+        ///
+        /// Caller must hold the draw mutex.
+        fn loadWallpaper(self: *Self, alloc: Allocator, path: []const u8) !void {
+            // Open the file
+            var file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+                log.warn("error opening wallpaper file \"{s}\": {}", .{ path, err });
+                return err;
+            };
+            defer file.close();
+
+            // Read it
+            const contents = file.readToEndAlloc(
+                alloc,
+                std.math.maxInt(u32),
+            ) catch |err| {
+                log.warn("error reading wallpaper file \"{s}\": {}", .{ path, err });
+                return err;
+            };
+            defer alloc.free(contents);
+
+            // Figure out file type
+            const file_type = switch (FileType.detect(contents)) {
+                .unknown => FileType.guessFromExtension(
+                    std.fs.path.extension(path),
+                ),
+                else => |t| t,
+            };
+
+            // Decode it with wuffs (same path as prepBackgroundImage)
+            const image_data = switch (file_type) {
+                .png => try wuffs.png.decode(alloc, contents),
+                .jpeg => try wuffs.jpeg.decode(alloc, contents),
+                .unknown => {
+                    log.warn("Cannot determine file type for wallpaper file \"{s}\"!", .{path});
+                    return error.UnsupportedImageFormat;
+                },
+                else => |f| {
+                    log.warn("Unsupported file type {} for wallpaper file \"{s}\"!", .{ f, path });
+                    return error.UnsupportedImageFormat;
+                },
+            };
+            defer alloc.free(image_data.data);
+
+            // wuffs always returns RGBA data directly.
+            const rgba = image_data.data;
+
+            const w = image_data.width;
+            const h = image_data.height;
+            const pixel_count = w * h;
+            const byte_count = pixel_count * 4; // always RGBA = 4 bytes
+
+            // Free old wallpaper buffer if it exists
+            if (self.wallpaper_buffer.len > 0) {
+                self.alloc.free(self.wallpaper_buffer);
+            }
+
+            // Copy pixels into our static CPU-side buffer
+            const buffer = try alloc.alloc(u8, byte_count);
+            @memcpy(buffer, rgba[0..byte_count]);
+
+            self.wallpaper_buffer = buffer;
+            self.wallpaper_width = w;
+            self.wallpaper_height = h;
+            self.wallpaper_buffer_modified +%= 1;
+            log.warn("loaded wallpaper w={} h={} bytes={}", .{ w, h, byte_count });
+        }
+
+        /// Unloads the wallpaper image data.
+        ///
+        /// Caller must hold the draw mutex.
+        fn unloadWallpaper(self: *Self) void {
+            if (self.wallpaper_buffer.len > 0) {
+                self.alloc.free(self.wallpaper_buffer);
+                self.wallpaper_buffer = &.{};
+                self.wallpaper_width = 0;
+                self.wallpaper_height = 0;
+            }
         }
 
         /// Call this any time the background image path changes.
@@ -2176,11 +2312,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const old_blending = self.config.blending;
             const custom_shaders_changed = !self.config.custom_shaders.equal(config.custom_shaders);
 
+            const wallpaper_changed =
+                if (self.config.wallpaper_image) |a|
+                    if (config.wallpaper_image) |b| !a.equal(b) else true
+                else
+                    config.wallpaper_image != null;
+
             self.config.deinit();
             self.config = config.*;
 
             // If our background image path changed, prepare the new bg image.
             if (bg_image_changed) try self.prepBackgroundImage();
+
+            if (wallpaper_changed) {
+                if (self.config.wallpaper_image) |path| {
+                    const path_str: []const u8 = switch (path) {
+                        inline else => |s| s,
+                    };
+                    try self.loadWallpaper(self.alloc, path_str);
+                } else {
+                    self.unloadWallpaper();
+                }
+            }
 
             // If our background image config changed, update the vertex buffer.
             if (bg_image_config_changed) self.updateBgImageBuffer();

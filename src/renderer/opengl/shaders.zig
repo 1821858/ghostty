@@ -40,6 +40,11 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
             .step_fn = .per_instance,
             .blending_enabled = true,
         } },
+        .{ "wallpaper", .{
+            .vertex_fn = loadShaderCode("../shaders/glsl/full_screen.v.glsl"),
+            .fragment_fn = loadShaderCode("../shaders/glsl/wallpaper.f.glsl"),
+            .blending_enabled = true,
+        } },
     };
 
 /// All the comptime-known info about a pipeline, so that
